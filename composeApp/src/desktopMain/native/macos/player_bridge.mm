@@ -897,33 +897,40 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     mpv_set_option_string(mpv, name, value);
 }
 
-static constexpr int64_t kPlayerDiskCacheBudgetBytes = 1024LL * 1024 * 1024;
+static constexpr int64_t kPlayerDiskCacheMaxBudgetBytes = 8LL * 1024 * 1024 * 1024;
+static constexpr int64_t kPlayerDiskCacheMinBudgetBytes = 1LL * 1024 * 1024 * 1024;
 
-static BOOL configurePlayerPacketCache(mpv_handle *mpv) {
-    // With disk caching these byte limits apply to packet metadata. They also
-    // bound the RAM payload when disk caching is unavailable or hits its budget.
-    setMpvOptionString(mpv, "demuxer-max-bytes", "32MiB");
-    setMpvOptionString(mpv, "demuxer-max-back-bytes", "8MiB");
-    setMpvOptionString(mpv, "cache-secs", "30");
-    setMpvOptionString(mpv, "demuxer-readahead-secs", "30");
+// Returns the disk budget in bytes, or 0 when packets stay in RAM.
+static int64_t configurePlayerPacketCache(mpv_handle *mpv) {
+    // RAM tier: used when disk caching is unavailable or its budget is spent.
+    // With disk caching on, these limits apply only to packet metadata.
+    // ~150 MiB is roughly 50 s of a 25 Mbps remux, enough to ride out
+    // network stalls on high-bitrate streams.
+    setMpvOptionString(mpv, "demuxer-max-bytes", "150MiB");
+    setMpvOptionString(mpv, "demuxer-max-back-bytes", "50MiB");
 
     NSString *cacheRoot = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-    if (!cacheRoot) return NO;
+    if (!cacheRoot) return 0;
     NSString *cacheDir = [cacheRoot stringByAppendingPathComponent:@"com.nuvio.media.desktop/player-packets"];
     NSError *error = nil;
     if (![NSFileManager.defaultManager createDirectoryAtPath:cacheDir
                                withIntermediateDirectories:YES attributes:nil error:&error]) {
-        return NO;
+        return 0;
     }
     NSDictionary *space = [NSFileManager.defaultManager attributesOfFileSystemForPath:cacheDir error:nil];
-    if ([space[NSFileSystemFreeSize] unsignedLongLongValue] < 2ULL * kPlayerDiskCacheBudgetBytes) {
-        return NO;
-    }
+    int64_t freeBytes = (int64_t)[space[NSFileSystemFreeSize] unsignedLongLongValue];
+    // Use at most a tenth of free space so the cache never starves swap.
+    int64_t budget = MIN(kPlayerDiskCacheMaxBudgetBytes, freeBytes / 10);
+    if (budget < kPlayerDiskCacheMinBudgetBytes) return 0;
     if (mpv_set_option_string(mpv, "demuxer-cache-dir", cacheDir.UTF8String) < 0 ||
-        mpv_set_option_string(mpv, "demuxer-cache-unlink-files", "immediate") < 0) {
-        return NO;
+        mpv_set_option_string(mpv, "demuxer-cache-unlink-files", "immediate") < 0 ||
+        mpv_set_option_string(mpv, "cache-on-disk", "yes") < 0) {
+        return 0;
     }
-    return mpv_set_option_string(mpv, "cache-on-disk", "yes") >= 0;
+    // Disk tier: payload goes to disk, so read further ahead than RAM allows.
+    // After the budget is spent, the RAM byte limits above take over.
+    setMpvOptionString(mpv, "cache-secs", "300");
+    return budget;
 }
 
 static BOOL enforcePlayerDiskCacheBudget(mpv_handle *mpv, int64_t budgetBytes) {
@@ -942,8 +949,9 @@ static BOOL enforcePlayerDiskCacheBudget(mpv_handle *mpv, int64_t budgetBytes) {
         mpv_free_node_contents(&state);
     }
     if (diskBytes < budgetBytes) return YES;
-    // mpv's file is append-only. Stop appending at the budget and use the small
-    // RAM cache for the rest of this playback. Existing disk data remains valid
+    // mpv's file is append-only, so this counts everything written since the
+    // media opened. Stop appending at the budget and use the RAM tier for the
+    // rest of this playback. Existing disk data remains valid
     // until the media closes; immediate unlink also cleans up after a crash.
     return mpv_set_property_string(mpv, "cache-on-disk", "no") < 0;
 }
@@ -1001,7 +1009,7 @@ static BOOL enforcePlayerDiskCacheBudget(mpv_handle *mpv, int64_t budgetBytes) {
     NSString *_pendingControlsJson;
     double _initialStartSeconds;
     BOOL _controlsSyncInFlight;
-    BOOL _packetDiskCacheEnabled;
+    int64_t _packetDiskCacheBudgetBytes;
     NSRect _lastAppliedNativeLayoutBounds;
     BOOL _lastAppliedNativeLayoutWasLiveResize;
     NSTimeInterval _lightweightResizeSettleUntil;
@@ -1625,16 +1633,14 @@ static BOOL enforcePlayerDiskCacheBudget(mpv_handle *mpv, int64_t budgetBytes) {
     } else {
         setMpvOptionString(_mpv, "vd-lavc-software-fallback", "yes");
     }
-    // Automatic software-decoder threading retains a frame per worker. Keep
-    // hardware decoding enabled above, and bound its software fallback workers.
-    setMpvOptionString(_mpv, "vd-lavc-threads", "4");
+    setMpvOptionString(_mpv, "vd-lavc-threads", "0");
     setMpvOptionString(_mpv, "target-colorspace-hint", "yes");
     setMpvOptionString(_mpv, "target-colorspace-hint-mode", "source");
     setMpvOptionString(_mpv, "target-colorspace-hint-strict", "no");
     setMpvOptionString(_mpv, "tone-mapping", "auto");
     setMpvOptionString(_mpv, "hdr-compute-peak", "no");
     setMpvOptionString(_mpv, "dither-depth", "auto");
-    _packetDiskCacheEnabled = configurePlayerPacketCache(_mpv);
+    _packetDiskCacheBudgetBytes = configurePlayerPacketCache(_mpv);
     setMpvOptionString(
         _mpv,
         "stream-lavf-o",
@@ -1707,8 +1713,9 @@ static BOOL enforcePlayerDiskCacheBudget(mpv_handle *mpv, int64_t budgetBytes) {
                 return;
             }
 
-            if (self->_packetDiskCacheEnabled) {
-                self->_packetDiskCacheEnabled = enforcePlayerDiskCacheBudget(mpv, kPlayerDiskCacheBudgetBytes);
+            if (self->_packetDiskCacheBudgetBytes > 0 &&
+                !enforcePlayerDiskCacheBudget(mpv, self->_packetDiskCacheBudgetBytes)) {
+                self->_packetDiskCacheBudgetBytes = 0;
             }
             uint64_t positionGeneration = [self cachedPositionGeneration];
             double duration = [self doubleProperty:"duration" fallback:0.0];
