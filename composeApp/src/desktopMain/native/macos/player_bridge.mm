@@ -897,6 +897,57 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     mpv_set_option_string(mpv, name, value);
 }
 
+static constexpr int64_t kPlayerDiskCacheBudgetBytes = 1024LL * 1024 * 1024;
+
+static BOOL configurePlayerPacketCache(mpv_handle *mpv) {
+    // With disk caching these byte limits apply to packet metadata. They also
+    // bound the RAM payload when disk caching is unavailable or hits its budget.
+    setMpvOptionString(mpv, "demuxer-max-bytes", "32MiB");
+    setMpvOptionString(mpv, "demuxer-max-back-bytes", "8MiB");
+    setMpvOptionString(mpv, "cache-secs", "30");
+    setMpvOptionString(mpv, "demuxer-readahead-secs", "30");
+
+    NSString *cacheRoot = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (!cacheRoot) return NO;
+    NSString *cacheDir = [cacheRoot stringByAppendingPathComponent:@"com.nuvio.media.desktop/player-packets"];
+    NSError *error = nil;
+    if (![NSFileManager.defaultManager createDirectoryAtPath:cacheDir
+                               withIntermediateDirectories:YES attributes:nil error:&error]) {
+        return NO;
+    }
+    NSDictionary *space = [NSFileManager.defaultManager attributesOfFileSystemForPath:cacheDir error:nil];
+    if ([space[NSFileSystemFreeSize] unsignedLongLongValue] < 2ULL * kPlayerDiskCacheBudgetBytes) {
+        return NO;
+    }
+    if (mpv_set_option_string(mpv, "demuxer-cache-dir", cacheDir.UTF8String) < 0 ||
+        mpv_set_option_string(mpv, "demuxer-cache-unlink-files", "immediate") < 0) {
+        return NO;
+    }
+    return mpv_set_option_string(mpv, "cache-on-disk", "yes") >= 0;
+}
+
+static BOOL enforcePlayerDiskCacheBudget(mpv_handle *mpv, int64_t budgetBytes) {
+    mpv_node state = {};
+    int64_t diskBytes = 0;
+    if (mpv_get_property(mpv, "demuxer-cache-state", MPV_FORMAT_NODE, &state) >= 0) {
+        if (state.format == MPV_FORMAT_NODE_MAP && state.u.list) {
+            for (int index = 0; index < state.u.list->num; index++) {
+                mpv_node &value = state.u.list->values[index];
+                if (strcmp(state.u.list->keys[index], "file-cache-bytes") == 0 && value.format == MPV_FORMAT_INT64) {
+                    diskBytes = value.u.int64;
+                    break;
+                }
+            }
+        }
+        mpv_free_node_contents(&state);
+    }
+    if (diskBytes < budgetBytes) return YES;
+    // mpv's file is append-only. Stop appending at the budget and use the small
+    // RAM cache for the rest of this playback. Existing disk data remains valid
+    // until the media closes; immediate unlink also cleans up after a crash.
+    return mpv_set_property_string(mpv, "cache-on-disk", "no") < 0;
+}
+
 @implementation MpvWebPlayer {
     NSView *_hostView;
     PlayerMetalView *_videoView;
@@ -950,6 +1001,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     NSString *_pendingControlsJson;
     double _initialStartSeconds;
     BOOL _controlsSyncInFlight;
+    BOOL _packetDiskCacheEnabled;
     NSRect _lastAppliedNativeLayoutBounds;
     BOOL _lastAppliedNativeLayoutWasLiveResize;
     NSTimeInterval _lightweightResizeSettleUntil;
@@ -1573,14 +1625,16 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     } else {
         setMpvOptionString(_mpv, "vd-lavc-software-fallback", "yes");
     }
-    setMpvOptionString(_mpv, "vd-lavc-threads", "0");
+    // Automatic software-decoder threading retains a frame per worker. Keep
+    // hardware decoding enabled above, and bound its software fallback workers.
+    setMpvOptionString(_mpv, "vd-lavc-threads", "4");
     setMpvOptionString(_mpv, "target-colorspace-hint", "yes");
     setMpvOptionString(_mpv, "target-colorspace-hint-mode", "source");
     setMpvOptionString(_mpv, "target-colorspace-hint-strict", "no");
     setMpvOptionString(_mpv, "tone-mapping", "auto");
     setMpvOptionString(_mpv, "hdr-compute-peak", "no");
     setMpvOptionString(_mpv, "dither-depth", "auto");
-    setMpvOptionString(_mpv, "demuxer-max-bytes", "150MiB");
+    _packetDiskCacheEnabled = configurePlayerPacketCache(_mpv);
     setMpvOptionString(
         _mpv,
         "stream-lavf-o",
@@ -1653,6 +1707,9 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                 return;
             }
 
+            if (self->_packetDiskCacheEnabled) {
+                self->_packetDiskCacheEnabled = enforcePlayerDiskCacheBudget(mpv, kPlayerDiskCacheBudgetBytes);
+            }
             uint64_t positionGeneration = [self cachedPositionGeneration];
             double duration = [self doubleProperty:"duration" fallback:0.0];
             double position = [self doubleProperty:"time-pos" fallback:0.0];
